@@ -87,6 +87,79 @@ func (m *Model) GetProfilesAppliedToAgentFilteredByProfile(siteID int, agentID s
 	return []*ent.Profile{}, nil
 }
 
+func (m *Model) SaveTaskStartReport(report nats.TaskStartReport) error {
+	var err error
+
+	exists := true
+	profileIssueID := -1
+	// Create issue or update the issue
+	profileIssue, err := m.Client.ProfileIssue.Query().Where(profileissue.HasProfileWith(profile.ID(report.ProfileID)), profileissue.HasAgentsWith(agent.ID(report.AgentID))).Only(context.Background())
+	if err != nil {
+		if !ent.IsNotFound(err) {
+			return err
+		}
+		exists = false
+	} else {
+		profileIssueID = profileIssue.ID
+	}
+
+	if !exists {
+		profileIssue, err = m.Client.ProfileIssue.Create().SetAgentsID(report.AgentID).SetProfileID(report.ProfileID).Save(context.Background())
+		if err != nil {
+			return err
+		}
+		profileIssueID = profileIssue.ID
+	}
+
+	taskID := report.TaskID
+	if taskID == 0 && report.Name != "" {
+		taskID, err = strconv.Atoi(strings.Split(strings.TrimPrefix(report.Name, "task_"), "_")[0])
+		if err != nil {
+			return errors.New("could not convert the task ID from string to int")
+		}
+	}
+
+	exists, err = m.Client.TaskReport.Query().
+		Where(
+			taskreport.HasProfileissueWith(profileissue.ID(profileIssueID)),
+			taskreport.HasTaskWith(task.ID(taskID)),
+		).
+		Exist(context.Background())
+
+	if err != nil {
+		log.Printf("[ERROR]: could not check if task report exists, reason: %v", err)
+		return err
+	}
+
+	if exists {
+		err := m.Client.TaskReport.Update().
+			Where(
+				taskreport.HasProfileissueWith(profileissue.ID(profileIssueID)),
+				taskreport.HasTaskWith(task.ID(taskID)),
+			).
+			SetStartedAt(report.StartTime).
+			SetStatus(taskreport.StatusRunning).
+			Exec(context.Background())
+		if err != nil {
+			log.Printf("[ERROR]: could not update task %d report for profile %d, reason: %v", taskID, profileIssueID, err)
+			return err
+		}
+	} else {
+		err := m.Client.TaskReport.Create().
+			SetProfileissueID(profileIssueID).
+			SetTaskID(taskID).
+			SetStartedAt(report.StartTime).
+			SetStatus(taskreport.StatusRunning).
+			Exec(context.Background())
+		if err != nil {
+			log.Printf("[ERROR]: could not save task %d report for profile %d, reason: %v", taskID, profileIssueID, err)
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (m *Model) SaveProfileApplicationIssues(p nats.ProfileReport) error {
 	var err error
 
@@ -166,8 +239,13 @@ func (m *Model) SaveProfileApplicationIssues(p nats.ProfileReport) error {
 				return err
 			}
 
+			status := taskreport.StatusCompleted
+			if report.Failed {
+				status = taskreport.StatusFailed
+			}
+
 			if exists {
-				err := m.Client.TaskReport.Update().
+				update := m.Client.TaskReport.Update().
 					Where(
 						taskreport.HasProfileissueWith(profileissue.ID(profileIssueID)),
 						taskreport.HasTaskWith(task.ID(taskID)),
@@ -176,19 +254,33 @@ func (m *Model) SaveProfileApplicationIssues(p nats.ProfileReport) error {
 					SetStdOutput(report.StdOut).
 					SetEnd(report.EndTime).
 					SetFailed(report.Failed).
-					Exec(context.Background())
+					SetStatus(status).
+					SetTimeout(report.Timeout)
+
+				if report.StartTime != "" {
+					update = update.SetStartedAt(report.StartTime)
+				}
+
+				err := update.Exec(context.Background())
 				if err != nil {
 					log.Printf("[ERROR]: could not save task %d report for profile %d, reason: %v", taskID, profileIssueID, err)
 				}
 			} else {
-				err := m.Client.TaskReport.Create().
+				create := m.Client.TaskReport.Create().
 					SetProfileissueID(profileIssueID).
 					SetTaskID(taskID).
 					SetStdError(report.StdErr).
 					SetStdOutput(report.StdOut).
 					SetEnd(report.EndTime).
 					SetFailed(report.Failed).
-					Exec(context.Background())
+					SetStatus(status).
+					SetTimeout(report.Timeout)
+
+				if report.StartTime != "" {
+					create = create.SetStartedAt(report.StartTime)
+				}
+
+				err := create.Exec(context.Background())
 				if err != nil {
 					log.Printf("[ERROR]: could not save task %d report for profile %d, reason: %v", taskID, profileIssueID, err)
 				}

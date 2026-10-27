@@ -85,6 +85,13 @@ func (w *Worker) SubscribeToAgentWorkerQueues() error {
 		return err
 	}
 	log.Printf("[INFO]: subscribed to message wingetcfg.report")
+
+	_, err = w.NATSConnection.QueueSubscribe("wingetcfg.task_started", "openuem-agents", w.TaskStartReportResponseHandler)
+	if err != nil {
+		log.Printf("[ERROR]: could not subscribe to wingetcfg.task_started NATS message, reason: %v", err)
+		return err
+	}
+	log.Printf("[INFO]: subscribed to message wingetcfg.task_started")
 	return nil
 }
 
@@ -950,4 +957,21 @@ func (w *Worker) ProfileReportResponseHandler(msg *nats.Msg) {
 	}
 
 	// log.Println("[DEBUG]: should have responded to wingetcfg.report message")
+}
+
+func (w *Worker) TaskStartReportResponseHandler(msg *nats.Msg) {
+	report := openuem_nats.TaskStartReport{}
+
+	// Unmarshal data
+	if err := json.Unmarshal(msg.Data, &report); err != nil {
+		log.Printf("[ERROR]: could not unmarshall TaskStart report from agent, reason: %v\n", err)
+	}
+
+	if err := w.Model.SaveTaskStartReport(report); err != nil {
+		log.Printf("[ERROR]: could not save TaskStart report, reason: %v\n", err)
+	}
+
+	if err := msg.Respond(nil); err != nil {
+		log.Printf("[ERROR]: could not respond to TaskStart report, reason: %v\n", err)
+	}
 }
