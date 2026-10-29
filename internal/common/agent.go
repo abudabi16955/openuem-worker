@@ -361,13 +361,15 @@ func (w *Worker) ApplyUnixEndpointProfiles(msg *nats.Msg) {
 		}
 
 		// Generate Ansible config
-		ansibleConfig, err := w.GenerateAnsibleConfig(profile, profileRequest.AgentID)
+		ansibleConfig, profileTimeout, err := w.GenerateAnsibleConfig(profile, profileRequest.AgentID)
 		if err != nil {
 			log.Printf("[ERROR]: could not generate ansible config for profile: %s, reason: %v", profile.Name, err)
 			continue
 		}
 
-		if len(ansibleConfig.Tasks) > 0 {
+		p.Timeout = profileTimeout
+
+		if ansibleConfig != nil && len(ansibleConfig.Tasks) > 0 {
 			p.AnsibleConfig = append(p.AnsibleConfig, ansibleConfig)
 		}
 
@@ -463,6 +465,18 @@ func (w *Worker) GenerateWinGetConfig(profile *ent.Profile) (*wingetcfg.WinGetCf
 		}
 
 		taskID := fmt.Sprintf("task_%d_%d", t.ID, t.Version)
+		addResource := func(res *wingetcfg.WinGetResource) {
+			if res == nil {
+				return
+			}
+			res.ID = taskID
+			if res.Settings == nil {
+				res.Settings = make(map[string]any)
+			}
+			res.Settings["ID"] = taskID
+			res.Settings["Timeout"] = t.Timeout
+			cfg.AddResource(res)
+		}
 
 		switch t.Type {
 		case task.TypeWingetInstall:
@@ -470,43 +484,43 @@ func (w *Worker) GenerateWinGetConfig(profile *ent.Profile) (*wingetcfg.WinGetCf
 			if err != nil {
 				return nil, err
 			}
-			cfg.AddResource(installPackage)
+			addResource(installPackage)
 		case task.TypeWingetDelete:
 			uninstallPackage, err := wingetcfg.UninstallPackage(taskID, t.PackageName, t.PackageID, "winget", t.PackageVersion, t.PackageLatest)
 			if err != nil {
 				return nil, err
 			}
-			cfg.AddResource(uninstallPackage)
+			addResource(uninstallPackage)
 		case task.TypeAddRegistryKey:
 			registryKey, err := wingetcfg.AddRegistryKey(taskID, t.Name, t.RegistryKey)
 			if err != nil {
 				return nil, err
 			}
-			cfg.AddResource(registryKey)
+			addResource(registryKey)
 		case task.TypeRemoveRegistryKey:
 			registryKey, err := wingetcfg.RemoveRegistryKey(taskID, t.Name, t.RegistryKey, t.RegistryForce)
 			if err != nil {
 				return nil, err
 			}
-			cfg.AddResource(registryKey)
+			addResource(registryKey)
 		case task.TypeUpdateRegistryKeyDefaultValue:
 			registryKey, err := wingetcfg.UpdateRegistryKeyDefaultValue(taskID, t.Name, t.RegistryKey, string(t.RegistryKeyValueType), t.RegistryKeyValueData, t.RegistryForce)
 			if err != nil {
 				return nil, err
 			}
-			cfg.AddResource(registryKey)
+			addResource(registryKey)
 		case task.TypeAddRegistryKeyValue:
 			registryKey, err := wingetcfg.AddRegistryValue(taskID, t.Name, t.RegistryKey, t.RegistryKeyValueName, string(t.RegistryKeyValueType), t.RegistryKeyValueData, t.RegistryHex, t.RegistryForce)
 			if err != nil {
 				return nil, err
 			}
-			cfg.AddResource(registryKey)
+			addResource(registryKey)
 		case task.TypeRemoveRegistryKeyValue:
 			registryKey, err := wingetcfg.RemoveRegistryValue(taskID, t.Name, t.RegistryKey, t.RegistryKeyValueName)
 			if err != nil {
 				return nil, err
 			}
-			cfg.AddResource(registryKey)
+			addResource(registryKey)
 		case task.TypeAddLocalUser:
 			// decrypt local user password if key is set
 			if w.EncryptionMasterKey != "" {
@@ -525,71 +539,83 @@ func (w *Worker) GenerateWinGetConfig(profile *ent.Profile) (*wingetcfg.WinGetCf
 			if err != nil {
 				return nil, err
 			}
-			cfg.AddResource(localUser)
+			addResource(localUser)
 		case task.TypeRemoveLocalUser:
 			localUser, err := wingetcfg.RemoveLocalUser(taskID, t.LocalUserUsername)
 			if err != nil {
 				return nil, err
 			}
-			cfg.AddResource(localUser)
+			addResource(localUser)
 		case task.TypeAddLocalGroup:
 			localGroup, err := wingetcfg.AddOrModifyLocalGroup(taskID, t.LocalGroupName, t.LocalGroupDescription, t.LocalGroupMembers)
 			if err != nil {
 				return nil, err
 			}
-			cfg.AddResource(localGroup)
+			addResource(localGroup)
 		case task.TypeRemoveLocalGroup:
 			localGroup, err := wingetcfg.RemoveLocalGroup(taskID, t.LocalGroupName)
 			if err != nil {
 				return nil, err
 			}
-			cfg.AddResource(localGroup)
+			addResource(localGroup)
 		case task.TypeAddUsersToLocalGroup:
 			localGroup, err := wingetcfg.IncludeMembersToGroup(taskID, t.LocalGroupName, t.LocalGroupMembersToInclude)
 			if err != nil {
 				return nil, err
 			}
-			cfg.AddResource(localGroup)
+			addResource(localGroup)
 		case task.TypeRemoveUsersFromLocalGroup:
 			localGroup, err := wingetcfg.ExcludeMembersFromGroup(taskID, t.LocalGroupName, t.LocalGroupMembersToExclude)
 			if err != nil {
 				return nil, err
 			}
-			cfg.AddResource(localGroup)
+			addResource(localGroup)
 		case task.TypeMsiInstall:
 			msiInstall, err := wingetcfg.InstallMSIPackage(taskID, fmt.Sprintf("Install %s", t.MsiProductid), t.MsiProductid, t.MsiPath, t.MsiArguments, t.MsiLogPath, t.MsiFileHash, string(t.MsiFileHashAlg))
 			if err != nil {
 				return nil, err
 			}
-			cfg.AddResource(msiInstall)
+			addResource(msiInstall)
 		case task.TypeMsiUninstall:
 			msiUninstall, err := wingetcfg.UninstallMSIPackage(taskID, fmt.Sprintf("Uninstall %s", t.MsiProductid), t.MsiProductid, t.MsiPath, t.MsiArguments, t.MsiLogPath, t.MsiFileHash, string(t.MsiFileHashAlg))
 			if err != nil {
 				return nil, err
 			}
-			cfg.AddResource(msiUninstall)
+			addResource(msiUninstall)
 		case task.TypePowershellScript:
 			msiUninstall, err := wingetcfg.ExecutePowershellScript(taskID, t.Name, t.Script, t.ScriptRun.String())
 			if err != nil {
 				return nil, err
 			}
-			cfg.AddResource(msiUninstall)
+			addResource(msiUninstall)
 		}
 	}
 	return cfg, nil
 }
 
-func (w *Worker) GenerateAnsibleConfig(profile *ent.Profile, agentID string) (*ansiblecfg.AnsiblePlaybook, error) {
+func (w *Worker) GenerateAnsibleConfig(profile *ent.Profile, agentID string) (*ansiblecfg.AnsiblePlaybook, int, error) {
 	var err error
 
 	if len(profile.Edges.Tasks) == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
 
 	a, err := w.Model.Client.Agent.Get(context.Background(), agentID)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
+
+	// Calculate dynamic timeout from profile tasks (sum or max with default fallback 300s)
+	profileTimeout := 0
+	for _, t := range profile.Edges.Tasks {
+		if t.Timeout > 0 {
+			profileTimeout += t.Timeout
+		}
+	}
+	if profileTimeout == 0 {
+		profileTimeout = 300
+	}
+	log.Printf("[DEBUG]: calculated Ansible execution timeout for profile %s: %d seconds", profile.Name, profileTimeout)
 
 	pb := ansiblecfg.NewAnsiblePlaybook()
 	pb.Name = profile.Name
@@ -629,13 +655,13 @@ func (w *Worker) GenerateAnsibleConfig(profile *ent.Profile, agentID string) (*a
 			if t.LocalGroupID != "" {
 				gid, err = strconv.Atoi(t.LocalGroupID)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			addLocalGroup, err := ansiblecfg.AddLocalGroup(fmt.Sprintf("task_%d", t.ID), t.LocalGroupName, gid, t.LocalGroupSystem, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(addLocalGroup)
 
@@ -653,63 +679,63 @@ func (w *Worker) GenerateAnsibleConfig(profile *ent.Profile, agentID string) (*a
 			if t.LocalUserExpires != "" {
 				expires, err = strconv.ParseFloat(t.LocalUserExpires, 64)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			if t.LocalUserPasswordExpireAccountDisable != "" {
 				password_expire_account_disable, err = strconv.Atoi(t.LocalUserPasswordExpireAccountDisable)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			if t.LocalUserPasswordExpireMax != "" {
 				password_expire_max, err = strconv.Atoi(t.LocalUserPasswordExpireMax)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			if t.LocalUserPasswordExpireMin != "" {
 				password_expire_min, err = strconv.Atoi(t.LocalUserPasswordExpireMin)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			if t.LocalUserPasswordExpireWarn != "" {
 				password_expire_warn, err = strconv.Atoi(t.LocalUserPasswordExpireWarn)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			if t.LocalUserSSHKeyBits != "" {
 				ssh_key_bits, err = strconv.Atoi(t.LocalUserSSHKeyBits)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			if t.LocalUserID != "" {
 				uid, err = strconv.Atoi(t.LocalUserID)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			if t.LocalUserIDMax != "" {
 				uid_max, err = strconv.Atoi(t.LocalUserIDMax)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			if t.LocalUserIDMin != "" {
 				uid_min, err = strconv.Atoi(t.LocalUserIDMin)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
@@ -717,12 +743,12 @@ func (w *Worker) GenerateAnsibleConfig(profile *ent.Profile, agentID string) (*a
 			if w.EncryptionMasterKey != "" {
 				isAccessTokenEncrypted, err := utils.IsSensitiveFieldEncrypted(t.LocalUserPassword, w.EncryptionMasterKey)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 
 				if isAccessTokenEncrypted {
 					t.LocalUserPassword, err = utils.DecryptSensitiveField(t.LocalUserPassword, w.EncryptionMasterKey)
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
@@ -734,81 +760,81 @@ func (w *Worker) GenerateAnsibleConfig(profile *ent.Profile, agentID string) (*a
 				t.LocalUserSystem, t.LocalUserUmask, uid, uid_max, uid_min, t.AgentType.String(), t.IgnoreErrors)
 
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(addLinuxUser)
 
 		case task.TypeRemoveLocalUser:
 			removeLinux, err := ansiblecfg.RemoveLocalUser(fmt.Sprintf("task_%d", t.ID), t.LocalUserForce, t.LocalUserUsername, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(removeLinux)
 
 		case task.TypeRemoveUnixLocalGroup:
 			removeLocalGroup, err := ansiblecfg.RemoveLocalGroup(fmt.Sprintf("task_%d", t.ID), t.LocalGroupName, t.LocalGroupForce, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(removeLocalGroup)
 
 		case task.TypeUnixScript:
 			executeScript, err := ansiblecfg.ExecuteScript(fmt.Sprintf("task_%d", t.ID), t.Script, t.ScriptExecutable, t.ScriptCreates, t.AgentType.String(), t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(executeScript)
 		case task.TypeFlatpakInstall:
 			install, err := ansiblecfg.InstallFlatpakPackage(fmt.Sprintf("task_%d", t.ID), t.PackageID, t.PackageBranch, t.PackageLatest, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(install)
 		case task.TypeFlatpakUninstall:
 			uninstall, err := ansiblecfg.UninstallFlatpakPackage(fmt.Sprintf("task_%d", t.ID), t.PackageID, t.PackageBranch, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(uninstall)
 		case task.TypeBrewFormulaInstall:
 			install, err := ansiblecfg.InstallHomeBrewFormula(fmt.Sprintf("task_%d", t.ID), t.PackageID, t.BrewInstallOptions, t.BrewUpdate, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(install)
 		case task.TypeBrewFormulaUpgrade:
 			upgrade, err := ansiblecfg.UpgradeHomeBrewFormula(fmt.Sprintf("task_%d", t.ID), t.PackageID, t.BrewUpdate, t.BrewUpgradeAll, t.BrewUpgradeOptions, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(upgrade)
 		case task.TypeBrewFormulaUninstall:
 			uninstall, err := ansiblecfg.UninstallHomeBrewFormula(fmt.Sprintf("task_%d", t.ID), t.PackageID, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(uninstall)
 		case task.TypeBrewCaskInstall:
 			install, err := ansiblecfg.InstallHomeBrewCask(fmt.Sprintf("task_%d", t.ID), t.PackageID, t.BrewInstallOptions, t.BrewUpdate, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(install)
 		case task.TypeBrewCaskUpgrade:
 			upgrade, err := ansiblecfg.UpgradeHomeBrewCask(fmt.Sprintf("task_%d", t.ID), t.PackageID, t.BrewGreedy, t.BrewUpdate, t.BrewUpgradeAll, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(upgrade)
 		case task.TypeBrewCaskUninstall:
 			uninstall, err := ansiblecfg.UninstallHomeBrewCask(fmt.Sprintf("task_%d", t.ID), t.PackageID, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(uninstall)
 		}
 	}
-	return pb, nil
+	return pb, profileTimeout, nil
 }
 
 func (w *Worker) GenerateNetbirdConfig(profile *ent.Profile, agentID string) ([]*openuem_nats.NetbirdTask, error) {
