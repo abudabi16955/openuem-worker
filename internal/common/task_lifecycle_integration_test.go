@@ -236,4 +236,45 @@ func TestTaskLifecycleIntegration(t *testing.T) {
 			t.Fatalf("task timeout=2 absent from config: %s", b)
 		}
 	})
+	t.Run("invalid_task_name_must_not_mark_all_running", func(t *testing.T) {
+		p, tTask, a := fixture(t)
+		v := wire.TaskStartReport{
+			ProfileID: p.ID,
+			AgentID:   a,
+			TaskID:    0,
+			Name:      "task_invalid",
+			StartTime: "2026-10-29T06:00:00Z",
+		}
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = nc.Request("wingetcfg.task_started", b, 5*time.Second)
+
+		reports, err := m.Client.TaskReport.Query().Where(taskreport.HasTaskWith(task.ID(tTask.ID))).All(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range reports {
+			if r.Status == taskreport.StatusRunning {
+				t.Fatalf("task was wrongly marked running on invalid task name: %+v", r)
+			}
+		}
+	})
+	t.Run("ansible_config_timeout_calculation", func(t *testing.T) {
+		p, tTask, a := fixture(t)
+		tTask.Type = "unix_script"
+		tTask.Script = "echo test"
+		p.Edges.Tasks = []*ent.Task{tTask}
+		pb, profileTimeout, err := w.GenerateAnsibleConfig(p, a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pb == nil {
+			t.Fatal("expected playbook to be generated")
+		}
+		if profileTimeout != 2 {
+			t.Fatalf("expected profileTimeout 2, got %d", profileTimeout)
+		}
+	})
 }

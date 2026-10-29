@@ -361,13 +361,15 @@ func (w *Worker) ApplyUnixEndpointProfiles(msg *nats.Msg) {
 		}
 
 		// Generate Ansible config
-		ansibleConfig, err := w.GenerateAnsibleConfig(profile, profileRequest.AgentID)
+		ansibleConfig, profileTimeout, err := w.GenerateAnsibleConfig(profile, profileRequest.AgentID)
 		if err != nil {
 			log.Printf("[ERROR]: could not generate ansible config for profile: %s, reason: %v", profile.Name, err)
 			continue
 		}
 
-		if len(ansibleConfig.Tasks) > 0 {
+		p.Timeout = profileTimeout
+
+		if ansibleConfig != nil && len(ansibleConfig.Tasks) > 0 {
 			p.AnsibleConfig = append(p.AnsibleConfig, ansibleConfig)
 		}
 
@@ -591,16 +593,16 @@ func (w *Worker) GenerateWinGetConfig(profile *ent.Profile) (*wingetcfg.WinGetCf
 	return cfg, nil
 }
 
-func (w *Worker) GenerateAnsibleConfig(profile *ent.Profile, agentID string) (*ansiblecfg.AnsiblePlaybook, error) {
+func (w *Worker) GenerateAnsibleConfig(profile *ent.Profile, agentID string) (*ansiblecfg.AnsiblePlaybook, int, error) {
 	var err error
 
 	if len(profile.Edges.Tasks) == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
 
 	a, err := w.Model.Client.Agent.Get(context.Background(), agentID)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	// Calculate dynamic timeout from profile tasks (sum or max with default fallback 300s)
@@ -653,13 +655,13 @@ func (w *Worker) GenerateAnsibleConfig(profile *ent.Profile, agentID string) (*a
 			if t.LocalGroupID != "" {
 				gid, err = strconv.Atoi(t.LocalGroupID)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			addLocalGroup, err := ansiblecfg.AddLocalGroup(fmt.Sprintf("task_%d", t.ID), t.LocalGroupName, gid, t.LocalGroupSystem, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(addLocalGroup)
 
@@ -677,63 +679,63 @@ func (w *Worker) GenerateAnsibleConfig(profile *ent.Profile, agentID string) (*a
 			if t.LocalUserExpires != "" {
 				expires, err = strconv.ParseFloat(t.LocalUserExpires, 64)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			if t.LocalUserPasswordExpireAccountDisable != "" {
 				password_expire_account_disable, err = strconv.Atoi(t.LocalUserPasswordExpireAccountDisable)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			if t.LocalUserPasswordExpireMax != "" {
 				password_expire_max, err = strconv.Atoi(t.LocalUserPasswordExpireMax)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			if t.LocalUserPasswordExpireMin != "" {
 				password_expire_min, err = strconv.Atoi(t.LocalUserPasswordExpireMin)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			if t.LocalUserPasswordExpireWarn != "" {
 				password_expire_warn, err = strconv.Atoi(t.LocalUserPasswordExpireWarn)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			if t.LocalUserSSHKeyBits != "" {
 				ssh_key_bits, err = strconv.Atoi(t.LocalUserSSHKeyBits)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			if t.LocalUserID != "" {
 				uid, err = strconv.Atoi(t.LocalUserID)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			if t.LocalUserIDMax != "" {
 				uid_max, err = strconv.Atoi(t.LocalUserIDMax)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
 			if t.LocalUserIDMin != "" {
 				uid_min, err = strconv.Atoi(t.LocalUserIDMin)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
@@ -741,12 +743,12 @@ func (w *Worker) GenerateAnsibleConfig(profile *ent.Profile, agentID string) (*a
 			if w.EncryptionMasterKey != "" {
 				isAccessTokenEncrypted, err := utils.IsSensitiveFieldEncrypted(t.LocalUserPassword, w.EncryptionMasterKey)
 				if err != nil {
-					return nil, err
+					return nil, 0, err
 				}
 
 				if isAccessTokenEncrypted {
 					t.LocalUserPassword, err = utils.DecryptSensitiveField(t.LocalUserPassword, w.EncryptionMasterKey)
-					return nil, err
+					return nil, 0, err
 				}
 			}
 
@@ -758,81 +760,81 @@ func (w *Worker) GenerateAnsibleConfig(profile *ent.Profile, agentID string) (*a
 				t.LocalUserSystem, t.LocalUserUmask, uid, uid_max, uid_min, t.AgentType.String(), t.IgnoreErrors)
 
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(addLinuxUser)
 
 		case task.TypeRemoveLocalUser:
 			removeLinux, err := ansiblecfg.RemoveLocalUser(fmt.Sprintf("task_%d", t.ID), t.LocalUserForce, t.LocalUserUsername, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(removeLinux)
 
 		case task.TypeRemoveUnixLocalGroup:
 			removeLocalGroup, err := ansiblecfg.RemoveLocalGroup(fmt.Sprintf("task_%d", t.ID), t.LocalGroupName, t.LocalGroupForce, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(removeLocalGroup)
 
 		case task.TypeUnixScript:
 			executeScript, err := ansiblecfg.ExecuteScript(fmt.Sprintf("task_%d", t.ID), t.Script, t.ScriptExecutable, t.ScriptCreates, t.AgentType.String(), t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(executeScript)
 		case task.TypeFlatpakInstall:
 			install, err := ansiblecfg.InstallFlatpakPackage(fmt.Sprintf("task_%d", t.ID), t.PackageID, t.PackageBranch, t.PackageLatest, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(install)
 		case task.TypeFlatpakUninstall:
 			uninstall, err := ansiblecfg.UninstallFlatpakPackage(fmt.Sprintf("task_%d", t.ID), t.PackageID, t.PackageBranch, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(uninstall)
 		case task.TypeBrewFormulaInstall:
 			install, err := ansiblecfg.InstallHomeBrewFormula(fmt.Sprintf("task_%d", t.ID), t.PackageID, t.BrewInstallOptions, t.BrewUpdate, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(install)
 		case task.TypeBrewFormulaUpgrade:
 			upgrade, err := ansiblecfg.UpgradeHomeBrewFormula(fmt.Sprintf("task_%d", t.ID), t.PackageID, t.BrewUpdate, t.BrewUpgradeAll, t.BrewUpgradeOptions, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(upgrade)
 		case task.TypeBrewFormulaUninstall:
 			uninstall, err := ansiblecfg.UninstallHomeBrewFormula(fmt.Sprintf("task_%d", t.ID), t.PackageID, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(uninstall)
 		case task.TypeBrewCaskInstall:
 			install, err := ansiblecfg.InstallHomeBrewCask(fmt.Sprintf("task_%d", t.ID), t.PackageID, t.BrewInstallOptions, t.BrewUpdate, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(install)
 		case task.TypeBrewCaskUpgrade:
 			upgrade, err := ansiblecfg.UpgradeHomeBrewCask(fmt.Sprintf("task_%d", t.ID), t.PackageID, t.BrewGreedy, t.BrewUpdate, t.BrewUpgradeAll, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(upgrade)
 		case task.TypeBrewCaskUninstall:
 			uninstall, err := ansiblecfg.UninstallHomeBrewCask(fmt.Sprintf("task_%d", t.ID), t.PackageID, t.IgnoreErrors)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			pb.AddAnsibleTask(uninstall)
 		}
 	}
-	return pb, nil
+	return pb, profileTimeout, nil
 }
 
 func (w *Worker) GenerateNetbirdConfig(profile *ent.Profile, agentID string) ([]*openuem_nats.NetbirdTask, error) {
