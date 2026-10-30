@@ -153,13 +153,30 @@ func (m *Model) SaveTaskStartReport(report nats.TaskStartReport) error {
 		}
 
 		if existing != nil {
-			// Late start guard: if report arrives after task completion
-			// (already completed), do not regress terminal status to running.
-			if existing.Status == taskreport.StatusCompleted {
-				continue
+			isTerminal := existing.Status == taskreport.StatusCompleted ||
+				existing.Status == taskreport.StatusFailed ||
+				existing.Timeout ||
+				existing.End != ""
+
+			if isTerminal {
+				// Late start guard: if report.StartTime <= existing.End (or <= existing.StartedAt), ignore packet
+				if existing.End != "" && isTimeNotAfter(report.StartTime, existing.End) {
+					continue
+				}
+				if existing.StartedAt != "" && isTimeNotAfter(report.StartTime, existing.StartedAt) {
+					continue
+				}
+				if report.StartTime == "" {
+					continue
+				}
+			} else {
+				// Old start after newer retry: if existing.StartedAt != "" and report.StartTime <= existing.StartedAt, ignore packet
+				if existing.StartedAt != "" && isTimeNotAfter(report.StartTime, existing.StartedAt) {
+					continue
+				}
 			}
 
-			// Terminal state cleanup on retry (or update running attempt)
+			// New execution / retry: update record to running, clear terminal fields and logs
 			err := m.Client.TaskReport.Update().
 				Where(
 					taskreport.HasProfileissueWith(profileissue.ID(profileIssueID)),
@@ -369,4 +386,26 @@ func (m *Model) SetFlatpakOrBrewDeploymentInfo(taskID int, p nats.ProfileReport,
 	if err := m.SaveFlatpakOrBrewDeployInfo(deployAction); err != nil {
 		log.Printf("[ERROR]: could not save deployment action for flatpak install task %d, reason: %v", taskID, err)
 	}
+}
+
+func parseReportTime(ts string) (time.Time, bool) {
+	if ts == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+		return t, true
+	}
+	if t, err := time.Parse(time.RFC3339, ts); err == nil {
+		return t, true
+	}
+	return time.Time{}, false
+}
+
+func isTimeNotAfter(ts1, ts2 string) bool {
+	t1, ok1 := parseReportTime(ts1)
+	t2, ok2 := parseReportTime(ts2)
+	if ok1 && ok2 {
+		return !t1.After(t2)
+	}
+	return ts1 <= ts2
 }
