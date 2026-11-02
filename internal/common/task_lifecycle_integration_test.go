@@ -152,6 +152,28 @@ func TestTaskLifecycleIntegration(t *testing.T) {
 			t.Fatal("late start regressed completed task")
 		}
 	})
+	t.Run("late_start_must_not_regress_timeout_or_failed", func(t *testing.T) {
+		p, task, a := fixture(t)
+		send(t, "wingetcfg.report", finish(p, task, a, true, true))
+		send(t, "wingetcfg.task_started", start(p, task, a))
+		r := get(t, task.ID)
+		if r.Status != taskreport.StatusFailed || !r.Timeout || !r.Failed || r.End == "" {
+			t.Fatalf("late start regressed failed/timeout task: %+v", r)
+		}
+	})
+	t.Run("old_start_after_newer_retry_ignored", func(t *testing.T) {
+		p, task, a := fixture(t)
+		newer := start(p, task, a)
+		newer.StartTime = "2026-10-29T06:05:00Z"
+		send(t, "wingetcfg.task_started", newer)
+		older := start(p, task, a)
+		older.StartTime = "2026-10-29T06:00:00Z"
+		send(t, "wingetcfg.task_started", older)
+		r := get(t, task.ID)
+		if r.Status != taskreport.StatusRunning || r.StartedAt != "2026-10-29T06:05:00Z" {
+			t.Fatalf("older start overwrote newer retry: %+v", r)
+		}
+	})
 	t.Run("unix_timeout_fallback_report", func(t *testing.T) {
 		p, task, a := fixture(t)
 		v := finish(p, task, a, true, true)
@@ -187,9 +209,11 @@ func TestTaskLifecycleIntegration(t *testing.T) {
 	t.Run("retry_must_clear_previous_timeout", func(t *testing.T) {
 		p, task, a := fixture(t)
 		send(t, "wingetcfg.report", finish(p, task, a, true, true))
-		send(t, "wingetcfg.task_started", start(p, task, a))
+		retry := start(p, task, a)
+		retry.StartTime = "2026-10-29T06:05:00Z"
+		send(t, "wingetcfg.task_started", retry)
 		r := get(t, task.ID)
-		if r.Status != taskreport.StatusRunning || r.Failed || r.Timeout || r.End != "" {
+		if r.Status != taskreport.StatusRunning || r.Failed || r.Timeout || r.End != "" || r.StartedAt != "2026-10-29T06:05:00Z" {
 			t.Fatalf("running attempt contains stale terminal fields: %+v", r)
 		}
 	})
