@@ -2,6 +2,7 @@ package models
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -279,4 +280,88 @@ func TestSaveTaskStartReportOutOfOrder(t *testing.T) {
 			t.Fatalf("valid retry did not cleanly reset report: %+v", r)
 		}
 	})
+}
+
+func TestSaveProfileApplicationIssuesFailureGuaranteedClosed(t *testing.T) {
+	client := enttest.Open(t, "sqlite3", "file:ent?mode=memory&_fk=1")
+	defer client.Close()
+	m := Model{Client: client}
+	ctx := context.Background()
+
+	p, err := client.Profile.Create().SetName("P_Failure").Save(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ag, err := client.Agent.Create().SetID("ag-fail-1").SetHostname("hostfail").SetOs("windows").Save(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tk, err := client.Task.Create().SetProfile(p).SetName("Task Failure").SetType(task.TypePowershellScript).Save(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Initial report with Failed: true and empty EndTime
+	err = m.SaveProfileApplicationIssues(nats.ProfileReport{
+		ProfileID: p.ID,
+		AgentID:   ag.ID,
+		Tasks: []nats.TaskReport{
+			{
+				Name:      fmt.Sprintf("task_%d_1", tk.ID),
+				Failed:    true,
+				EndTime:   "",
+				StdErr:    "script failed with error exit status 1",
+				StartTime: "2026-10-30T10:00:00Z",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SaveProfileApplicationIssues failed: %v", err)
+	}
+
+	r, err := client.TaskReport.Query().Where(taskreport.HasTaskWith(task.ID(tk.ID))).Only(ctx)
+	if err != nil {
+		t.Fatalf("failed to query task report: %v", err)
+	}
+
+	if r.Status != taskreport.StatusFailed {
+		t.Errorf("expected StatusFailed, got %v", r.Status)
+	}
+	if !r.Failed {
+		t.Errorf("expected Failed=true, got false")
+	}
+	if r.End == "" {
+		t.Errorf("expected End to be auto-populated with current time when EndTime was empty")
+	}
+	if r.StdError != "script failed with error exit status 1" {
+		t.Errorf("unexpected StdError: %q", r.StdError)
+	}
+
+	// 2. Late TaskStartReport arrives with earlier StartTime: late start guard must prevent reopening to running
+	err = m.SaveTaskStartReport(nats.TaskStartReport{
+		ProfileID: p.ID,
+		AgentID:   ag.ID,
+		TaskID:    tk.ID,
+		StartTime: "2026-10-30T10:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("SaveTaskStartReport failed: %v", err)
+	}
+
+	rAfterLateStart, err := client.TaskReport.Query().Where(taskreport.HasTaskWith(task.ID(tk.ID))).Only(ctx)
+	if err != nil {
+		t.Fatalf("failed to query task report: %v", err)
+	}
+
+	if rAfterLateStart.Status != taskreport.StatusFailed {
+		t.Errorf("late start report reopened terminal failed task to %v", rAfterLateStart.Status)
+	}
+	if !rAfterLateStart.Failed {
+		t.Errorf("expected Failed to remain true")
+	}
+	if rAfterLateStart.End != r.End {
+		t.Errorf("expected End timestamp to remain unchanged, got %q, was %q", rAfterLateStart.End, r.End)
+	}
 }

@@ -166,7 +166,7 @@ func (m *Model) SaveTaskStartReport(report nats.TaskStartReport) error {
 				if existing.StartedAt != "" && isTimeNotAfter(report.StartTime, existing.StartedAt) {
 					continue
 				}
-				if report.StartTime == "" {
+				if report.StartTime == "" || (existing.End == "" && existing.StartedAt == "") {
 					continue
 				}
 			} else {
@@ -310,6 +310,11 @@ func (m *Model) SaveProfileApplicationIssues(p nats.ProfileReport) error {
 					status = taskreport.StatusFailed
 				}
 
+				endTime := report.EndTime
+				if endTime == "" {
+					endTime = time.Now().Local().Format(time.RFC3339Nano)
+				}
+
 				if exists {
 					update := m.Client.TaskReport.Update().
 						Where(
@@ -318,7 +323,7 @@ func (m *Model) SaveProfileApplicationIssues(p nats.ProfileReport) error {
 						).
 						SetStdError(report.StdErr).
 						SetStdOutput(report.StdOut).
-						SetEnd(report.EndTime).
+						SetEnd(endTime).
 						SetFailed(report.Failed).
 						SetStatus(status).
 						SetTimeout(report.Timeout)
@@ -337,7 +342,7 @@ func (m *Model) SaveProfileApplicationIssues(p nats.ProfileReport) error {
 						SetTaskID(taskID).
 						SetStdError(report.StdErr).
 						SetStdOutput(report.StdOut).
-						SetEnd(report.EndTime).
+						SetEnd(endTime).
 						SetFailed(report.Failed).
 						SetStatus(status).
 						SetTimeout(report.Timeout)
