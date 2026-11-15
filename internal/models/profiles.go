@@ -1,6 +1,7 @@
 package models
 
 import (
+	"fmt"
 	"context"
 	"errors"
 	"log"
@@ -87,6 +88,129 @@ func (m *Model) GetProfilesAppliedToAgentFilteredByProfile(siteID int, agentID s
 	return []*ent.Profile{}, nil
 }
 
+func (m *Model) SaveTaskStartReport(report nats.TaskStartReport) error {
+	var err error
+
+	exists := true
+	profileIssueID := -1
+	// Create issue or update the issue
+	profileIssue, err := m.Client.ProfileIssue.Query().Where(profileissue.HasProfileWith(profile.ID(report.ProfileID)), profileissue.HasAgentsWith(agent.ID(report.AgentID))).Only(context.Background())
+	if err != nil {
+		if !ent.IsNotFound(err) {
+			return err
+		}
+		exists = false
+	} else {
+		profileIssueID = profileIssue.ID
+	}
+
+	if !exists {
+		profileIssue, err = m.Client.ProfileIssue.Create().SetAgentsID(report.AgentID).SetProfileID(report.ProfileID).Save(context.Background())
+		if err != nil {
+			return err
+		}
+		profileIssueID = profileIssue.ID
+	}
+
+	var taskIDs []int
+	if report.TaskID != 0 {
+		taskIDs = append(taskIDs, report.TaskID)
+	} else if strings.HasPrefix(report.Name, "task_") {
+		taskID, err := strconv.Atoi(strings.Split(strings.TrimPrefix(report.Name, "task_"), "_")[0])
+		if err != nil || taskID <= 0 {
+			log.Printf("[ERROR]: invalid task name %s in start report for profile %d", report.Name, report.ProfileID)
+			return fmt.Errorf("invalid task name format: %s", report.Name)
+		}
+		taskIDs = append(taskIDs, taskID)
+	} else if report.TaskID == 0 && (strings.HasPrefix(report.Name, "profile_") || report.Name == "") {
+		// Explicit Unix profile-level start report: mark associated active profile tasks in DB as running with StartedAt
+		profileTasks, err := m.Client.Task.Query().
+			Where(task.HasProfileWith(profile.ID(report.ProfileID)), task.Disabled(false)).
+			All(context.Background())
+		if err != nil {
+			log.Printf("[ERROR]: could not get profile tasks for start report, reason: %v", err)
+			return err
+		}
+		for _, pt := range profileTasks {
+			taskIDs = append(taskIDs, pt.ID)
+		}
+	} else {
+		log.Printf("[ERROR]: unrecognized task start report format (taskID=%d, name=%s) for profile %d", report.TaskID, report.Name, report.ProfileID)
+		return fmt.Errorf("unrecognized task start report format: taskID=%d, name=%s", report.TaskID, report.Name)
+	}
+
+	for _, taskID := range taskIDs {
+		existing, err := m.Client.TaskReport.Query().
+			Where(
+				taskreport.HasProfileissueWith(profileissue.ID(profileIssueID)),
+				taskreport.HasTaskWith(task.ID(taskID)),
+			).
+			Only(context.Background())
+
+		if err != nil && !ent.IsNotFound(err) {
+			log.Printf("[ERROR]: could not check if task report exists, reason: %v", err)
+			return err
+		}
+
+		if existing != nil {
+			isTerminal := existing.Status == taskreport.StatusCompleted ||
+				existing.Status == taskreport.StatusFailed ||
+				existing.Timeout ||
+				existing.End != ""
+
+			if isTerminal {
+				// Late start guard: if report.StartTime <= existing.End (or <= existing.StartedAt), ignore packet
+				if existing.End != "" && isTimeNotAfter(report.StartTime, existing.End) {
+					continue
+				}
+				if existing.StartedAt != "" && isTimeNotAfter(report.StartTime, existing.StartedAt) {
+					continue
+				}
+				if report.StartTime == "" || (existing.End == "" && existing.StartedAt == "") {
+					continue
+				}
+			} else {
+				// Old start after newer retry: if existing.StartedAt != "" and report.StartTime <= existing.StartedAt, ignore packet
+				if existing.StartedAt != "" && isTimeNotAfter(report.StartTime, existing.StartedAt) {
+					continue
+				}
+			}
+
+			// New execution / retry: update record to running, clear terminal fields and logs
+			err := m.Client.TaskReport.Update().
+				Where(
+					taskreport.HasProfileissueWith(profileissue.ID(profileIssueID)),
+					taskreport.HasTaskWith(task.ID(taskID)),
+				).
+				SetStartedAt(report.StartTime).
+				SetStatus(taskreport.StatusRunning).
+				SetFailed(false).
+				SetTimeout(false).
+				SetEnd("").
+				SetStdOutput("").
+				SetStdError("").
+				Exec(context.Background())
+			if err != nil {
+				log.Printf("[ERROR]: could not update task %d report for profile %d, reason: %v", taskID, profileIssueID, err)
+				return err
+			}
+		} else {
+			err := m.Client.TaskReport.Create().
+				SetProfileissueID(profileIssueID).
+				SetTaskID(taskID).
+				SetStartedAt(report.StartTime).
+				SetStatus(taskreport.StatusRunning).
+				Exec(context.Background())
+			if err != nil {
+				log.Printf("[ERROR]: could not save task %d report for profile %d, reason: %v", taskID, profileIssueID, err)
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
 func (m *Model) SaveProfileApplicationIssues(p nats.ProfileReport) error {
 	var err error
 
@@ -118,79 +242,119 @@ func (m *Model) SaveProfileApplicationIssues(p nats.ProfileReport) error {
 	// Now, we must store the report for the profile's tasks
 	if p.Tasks != nil {
 		for _, report := range p.Tasks {
-
-			taskID, err := strconv.Atoi(strings.Split(strings.TrimPrefix(report.Name, "task_"), "_")[0])
-			if err != nil {
-				return errors.New("could not convert the task ID from string to int")
-			}
-
-			taskExist := true
-
-			theTask, err := m.Client.Task.Query().Where(task.ID(taskID)).First(context.Background())
-			if err != nil {
-				if ent.IsNotFound(err) {
-					taskExist = false
-				} else {
-					log.Printf("[ERROR]: could not check if profile task exists, reason: %v", err)
+			var targetTaskIDs []int
+			if strings.HasPrefix(report.Name, "profile_") {
+				profileTasks, err := m.Client.Task.Query().
+					Where(task.HasProfileWith(profile.ID(p.ProfileID)), task.Disabled(false)).
+					All(context.Background())
+				if err != nil {
+					log.Printf("[ERROR]: could not get profile tasks for fallback report, reason: %v", err)
 					return err
 				}
+				for _, pt := range profileTasks {
+					targetTaskIDs = append(targetTaskIDs, pt.ID)
+				}
+			} else {
+				taskID, err := strconv.Atoi(strings.Split(strings.TrimPrefix(report.Name, "task_"), "_")[0])
+				if err != nil {
+					return errors.New("could not convert the task ID from string to int")
+				}
+				targetTaskIDs = append(targetTaskIDs, taskID)
 			}
 
-			if !taskExist {
-				log.Printf("[ERROR]: the task %d for profile %d, doesn't exist", taskID, profileIssueID)
-				continue
-			}
+			for _, taskID := range targetTaskIDs {
+				taskExist := true
 
-			// if we have a task to install, update or delete a package we must try to update the deployment info
-			if theTask.Type == task.TypeFlatpakInstall || theTask.Type == task.TypeBrewCaskInstall || theTask.Type == task.TypeBrewFormulaInstall {
-				m.SetFlatpakOrBrewDeploymentInfo(taskID, p, report, theTask, "install")
-			}
+				theTask, err := m.Client.Task.Query().Where(task.ID(taskID)).First(context.Background())
+				if err != nil {
+					if ent.IsNotFound(err) {
+						taskExist = false
+					} else {
+						log.Printf("[ERROR]: could not check if profile task exists, reason: %v", err)
+						return err
+					}
+				}
 
-			if theTask.Type == task.TypeBrewCaskUpgrade {
-				m.SetFlatpakOrBrewDeploymentInfo(taskID, p, report, theTask, "update")
-			}
+				if !taskExist {
+					log.Printf("[ERROR]: the task %d for profile %d, doesn't exist", taskID, profileIssueID)
+					continue
+				}
 
-			if theTask.Type == task.TypeFlatpakUninstall || theTask.Type == task.TypeBrewCaskUninstall || theTask.Type == task.TypeBrewFormulaUninstall {
-				m.SetFlatpakOrBrewDeploymentInfo(taskID, p, report, theTask, "uninstall")
-			}
+				// if we have a task to install, update or delete a package we must try to update the deployment info
+				if theTask.Type == task.TypeFlatpakInstall || theTask.Type == task.TypeBrewCaskInstall || theTask.Type == task.TypeBrewFormulaInstall {
+					m.SetFlatpakOrBrewDeploymentInfo(taskID, p, report, theTask, "install")
+				}
 
-			exists, err := m.Client.TaskReport.Query().
-				Where(
-					taskreport.HasProfileissueWith(profileissue.ID(profileIssueID)),
-					taskreport.HasTaskWith(task.ID(taskID)),
-				).
-				Exist(context.Background())
+				if theTask.Type == task.TypeBrewCaskUpgrade {
+					m.SetFlatpakOrBrewDeploymentInfo(taskID, p, report, theTask, "update")
+				}
 
-			if err != nil {
-				log.Printf("[ERROR]: could not check if profile issue exists, reason: %v", err)
-				return err
-			}
+				if theTask.Type == task.TypeFlatpakUninstall || theTask.Type == task.TypeBrewCaskUninstall || theTask.Type == task.TypeBrewFormulaUninstall {
+					m.SetFlatpakOrBrewDeploymentInfo(taskID, p, report, theTask, "uninstall")
+				}
 
-			if exists {
-				err := m.Client.TaskReport.Update().
+				exists, err := m.Client.TaskReport.Query().
 					Where(
 						taskreport.HasProfileissueWith(profileissue.ID(profileIssueID)),
 						taskreport.HasTaskWith(task.ID(taskID)),
 					).
-					SetStdError(report.StdErr).
-					SetStdOutput(report.StdOut).
-					SetEnd(report.EndTime).
-					SetFailed(report.Failed).
-					Exec(context.Background())
+					Exist(context.Background())
+
 				if err != nil {
-					log.Printf("[ERROR]: could not save task %d report for profile %d, reason: %v", taskID, profileIssueID, err)
+					log.Printf("[ERROR]: could not check if profile issue exists, reason: %v", err)
+					return err
 				}
-			} else {
-				err := m.Client.TaskReport.Create().
-					SetProfileissueID(profileIssueID).
-					SetTaskID(taskID).
-					SetStdError(report.StdErr).
-					SetStdOutput(report.StdOut).
-					SetEnd(report.EndTime).
-					SetFailed(report.Failed).
-					Exec(context.Background())
-				if err != nil {
-					log.Printf("[ERROR]: could not save task %d report for profile %d, reason: %v", taskID, profileIssueID, err)
+
+				status := taskreport.StatusCompleted
+				if report.Failed {
+					status = taskreport.StatusFailed
+				}
+
+				endTime := report.EndTime
+				if endTime == "" {
+					endTime = time.Now().Local().Format(time.RFC3339Nano)
+				}
+
+				if exists {
+					update := m.Client.TaskReport.Update().
+						Where(
+							taskreport.HasProfileissueWith(profileissue.ID(profileIssueID)),
+							taskreport.HasTaskWith(task.ID(taskID)),
+						).
+						SetStdError(report.StdErr).
+						SetStdOutput(report.StdOut).
+						SetEnd(endTime).
+						SetFailed(report.Failed).
+						SetStatus(status).
+						SetTimeout(report.Timeout)
+
+					if report.StartTime != "" {
+						update = update.SetStartedAt(report.StartTime)
+					}
+
+					err := update.Exec(context.Background())
+					if err != nil {
+						log.Printf("[ERROR]: could not save task %d report for profile %d, reason: %v", taskID, profileIssueID, err)
+					}
+				} else {
+					create := m.Client.TaskReport.Create().
+						SetProfileissueID(profileIssueID).
+						SetTaskID(taskID).
+						SetStdError(report.StdErr).
+						SetStdOutput(report.StdOut).
+						SetEnd(endTime).
+						SetFailed(report.Failed).
+						SetStatus(status).
+						SetTimeout(report.Timeout)
+
+					if report.StartTime != "" {
+						create = create.SetStartedAt(report.StartTime)
+					}
+
+					err := create.Exec(context.Background())
+					if err != nil {
+						log.Printf("[ERROR]: could not save task %d report for profile %d, reason: %v", taskID, profileIssueID, err)
+					}
 				}
 			}
 		}
@@ -227,4 +391,26 @@ func (m *Model) SetFlatpakOrBrewDeploymentInfo(taskID int, p nats.ProfileReport,
 	if err := m.SaveFlatpakOrBrewDeployInfo(deployAction); err != nil {
 		log.Printf("[ERROR]: could not save deployment action for flatpak install task %d, reason: %v", taskID, err)
 	}
+}
+
+func parseReportTime(ts string) (time.Time, bool) {
+	if ts == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+		return t, true
+	}
+	if t, err := time.Parse(time.RFC3339, ts); err == nil {
+		return t, true
+	}
+	return time.Time{}, false
+}
+
+func isTimeNotAfter(ts1, ts2 string) bool {
+	t1, ok1 := parseReportTime(ts1)
+	t2, ok2 := parseReportTime(ts2)
+	if ok1 && ok2 {
+		return !t1.After(t2)
+	}
+	return ts1 <= ts2
 }

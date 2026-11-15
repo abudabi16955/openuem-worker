@@ -7,6 +7,7 @@ require (
 	github.com/a-h/templ v0.3.1001
 	github.com/go-co-op/gocron/v2 v2.19.1
 	github.com/jackc/pgx/v5 v5.8.0
+	github.com/mattn/go-sqlite3 v1.14.28
 	github.com/nats-io/nats.go v1.49.0
 	github.com/open-uem/ent v0.0.0-20260427091717-6f7d005adb1d
 	github.com/open-uem/nats v0.11.1-0.20260327113100-98373a46adcf
