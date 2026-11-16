@@ -56,4 +56,4 @@ require (
 
 replace github.com/open-uem/nats => github.com/abudabi16955/nats v0.0.0-20261116164838-d260a216a7f0
 
-replace github.com/open-uem/ent => github.com/abudabi16955/ent v0.0.0-20261027070654-78daeb184557
+replace github.com/open-uem/ent => github.com/abudabi16955/ent v0.0.0-20261116185824-251d171e1d39
