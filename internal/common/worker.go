@@ -47,6 +47,7 @@ type Worker struct {
 	Replicas               int
 	Jetstream              jetstream.JetStream
 	EncryptionMasterKey    string
+	VaultKey               []byte
 }
 
 func NewWorker(logName string) *Worker {

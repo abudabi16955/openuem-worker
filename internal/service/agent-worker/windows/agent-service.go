@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-co-op/gocron/v2"
 	"github.com/open-uem/openuem-worker/internal/common"
+	"github.com/open-uem/openuem-worker/internal/crypto"
 	"github.com/open-uem/utils"
 	"golang.org/x/sys/windows/svc"
 )
@@ -15,6 +16,7 @@ func main() {
 	var err error
 
 	w := common.NewWorker("openuem-agent-worker.txt")
+	w.VaultKey = crypto.MustGetVaultKey()
 	s := utils.NewOpenUEMWindowsService()
 
 	// Start Task Scheduler

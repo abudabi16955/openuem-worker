@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-co-op/gocron/v2"
 	"github.com/open-uem/openuem-worker/internal/common"
+	"github.com/open-uem/openuem-worker/internal/crypto"
 	"github.com/urfave/cli/v2"
 )
 
@@ -36,6 +37,7 @@ func startAgentsWorker(cCtx *cli.Context) error {
 	var err error
 
 	worker := common.NewWorker("")
+	worker.VaultKey = crypto.MustGetVaultKey()
 
 	if err := worker.CheckCLICommonRequisites(cCtx); err != nil {
 		log.Printf("[ERROR]: could not generate config for Agents Worker: %v", err)

@@ -11,6 +11,7 @@ import (
 	"github.com/go-co-op/gocron/v2"
 	"github.com/open-uem/utils"
 	"gopkg.in/ini.v1"
+	"github.com/open-uem/openuem-worker/internal/crypto"
 )
 
 func (w *Worker) GenerateCommonWorkerConfig(c string) error {
@@ -88,6 +89,10 @@ func (w *Worker) GenerateCommonWorkerConfig(c string) error {
 				}
 			}
 		}
+	}
+
+	if c == "agent-worker" {
+		w.VaultKey = crypto.MustGetVaultKey()
 	}
 
 	return nil
