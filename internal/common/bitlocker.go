@@ -31,10 +31,26 @@ func (w *Worker) SubscribeToBitLockerWorkerQueues() error {
 
 // BitLockerEscrowHandler handles incoming BitLocker recovery key escrow reports from agents.
 func (w *Worker) BitLockerEscrowHandler(msg *nats.Msg) {
+	respond := func(success bool, errMsg string) {
+		if msg.Reply != "" {
+			resp := openuem_nats.BitLockerEscrowResponse{
+				Success: success,
+				Error:   errMsg,
+			}
+			respBytes, err := json.Marshal(resp)
+			if err == nil {
+				if rErr := msg.Respond(respBytes); rErr != nil {
+					log.Printf("[WARN]: failed to send BitLocker escrow response on reply %s: %v", msg.Reply, rErr)
+				}
+			}
+		}
+	}
+
 	if len(w.VaultKey) == 0 {
 		key, err := crypto.GetVaultKey()
 		if err != nil {
 			log.Printf("[ERROR]: cannot handle BitLocker escrow, vault key not configured: %v", err)
+			respond(false, "vault key not configured: "+err.Error())
 			return
 		}
 		w.VaultKey = key
@@ -43,6 +59,7 @@ func (w *Worker) BitLockerEscrowHandler(msg *nats.Msg) {
 	var escrowReq openuem_nats.BitLockerEscrowRequest
 	if err := json.Unmarshal(msg.Data, &escrowReq); err != nil {
 		log.Printf("[ERROR]: could not unmarshal BitLocker escrow request: %v", err)
+		respond(false, "could not unmarshal BitLocker escrow request: "+err.Error())
 		return
 	}
 
@@ -56,11 +73,13 @@ func (w *Worker) BitLockerEscrowHandler(msg *nats.Msg) {
 	saved, err := w.Model.SaveBitLockerEscrow(&escrowReq, w.VaultKey)
 	if err != nil {
 		log.Printf("[ERROR]: could not save BitLocker escrow for agent %s: %v", escrowReq.AgentID, err)
+		respond(false, "could not save BitLocker escrow: "+err.Error())
 		return
 	}
 
 	log.Printf("[INFO]: successfully escrowed BitLocker key %s for agent %s drive %s (id: %d)",
 		saved.KeyID, saved.AgentID, saved.DriveLetter, saved.ID)
+	respond(true, "")
 }
 
 // BitLockerRotateHandler handles incoming BitLocker recovery key rotation confirmations from agents.

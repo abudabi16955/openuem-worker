@@ -12,6 +12,10 @@ import (
 	openuem_nats "github.com/open-uem/nats"
 	"github.com/open-uem/openuem-worker/internal/crypto"
 	"github.com/open-uem/openuem-worker/internal/models"
+	"fmt"
+	"net"
+	"os/exec"
+	"strconv"
 )
 
 func TestBitLockerEscrowHandler_SuccessAndRotation(t *testing.T) {
@@ -195,5 +199,216 @@ func TestBitLockerRotateHandler(t *testing.T) {
 		if k.KeyID == "{KEY-OLD}" && k.IsActive {
 			t.Fatal("expected old key to be deactivated after rotate message")
 		}
+	}
+}
+
+func startTestNatsServer(t *testing.T) (string, func()) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to find free port for nats: %v", err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+
+	cmd := exec.Command("nats-server", "-a", "127.0.0.1", "-p", strconv.Itoa(port))
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start nats-server: %v", err)
+	}
+
+	url := fmt.Sprintf("nats://127.0.0.1:%d", port)
+	ready := false
+	for i := 0; i < 50; i++ {
+		time.Sleep(50 * time.Millisecond)
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			ready = true
+			break
+		}
+	}
+	if !ready {
+		_ = cmd.Process.Kill()
+		t.Fatalf("nats-server did not become ready in time on %s", url)
+	}
+
+	cleanup := func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}
+	return url, cleanup
+}
+
+func TestBitLockerEscrowHandler_RequestReply_Success(t *testing.T) {
+	natsURL, cleanupNATS := startTestNatsServer(t)
+	defer cleanupNATS()
+
+	nc, err := nats.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("failed to connect to test nats: %v", err)
+	}
+	defer nc.Close()
+
+	client := enttest.Open(t, "sqlite3", "file:ent?mode=memory&_fk=1")
+	defer client.Close()
+
+	vaultKey := make([]byte, crypto.KeySize)
+	rand.Read(vaultKey)
+
+	worker := &Worker{
+		Model:          &models.Model{Client: client},
+		VaultKey:       vaultKey,
+		NATSConnection: nc,
+	}
+
+	sub, err := nc.QueueSubscribe(openuem_nats.BitLockerEscrowSubjectPattern, "openuem-agents", worker.BitLockerEscrowHandler)
+	if err != nil {
+		t.Fatalf("failed to queue subscribe: %v", err)
+	}
+	defer sub.Unsubscribe()
+	if err := nc.Flush(); err != nil {
+		t.Fatalf("failed to flush nats: %v", err)
+	}
+
+	agentID := "agent-req-reply-1"
+	req := openuem_nats.BitLockerEscrowRequest{
+		AgentID:          agentID,
+		DriveLetter:      "C:",
+		KeyID:            "{KEY-RR-111}",
+		RecoveryPassword: "123456-123456-123456-123456",
+		CreatedAt:        time.Now(),
+	}
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("failed to marshal req: %v", err)
+	}
+
+	subject := openuem_nats.BitLockerEscrowSubject(agentID)
+	respMsg, err := nc.Request(subject, reqData, 5*time.Second)
+	if err != nil {
+		t.Fatalf("nc.Request failed: %v", err)
+	}
+
+	var resp openuem_nats.BitLockerEscrowResponse
+	if err := json.Unmarshal(respMsg.Data, &resp); err != nil {
+		t.Fatalf("failed to unmarshal BitLockerEscrowResponse: %v", err)
+	}
+
+	if !resp.Success {
+		t.Fatalf("expected escrow response success true, got false (error: %s)", resp.Error)
+	}
+	if resp.Error != "" {
+		t.Fatalf("expected empty error in success response, got %s", resp.Error)
+	}
+
+	// Verify key in DB
+	key, err := worker.Model.GetActiveBitLockerKey(agentID, "C:")
+	if err != nil {
+		t.Fatalf("failed to get active key from DB: %v", err)
+	}
+	if key.KeyID != "{KEY-RR-111}" {
+		t.Fatalf("expected key ID {KEY-RR-111}, got %s", key.KeyID)
+	}
+}
+
+func TestBitLockerEscrowHandler_RequestReply_InvalidJSON_Error(t *testing.T) {
+	natsURL, cleanupNATS := startTestNatsServer(t)
+	defer cleanupNATS()
+
+	nc, err := nats.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("failed to connect to test nats: %v", err)
+	}
+	defer nc.Close()
+
+	client := enttest.Open(t, "sqlite3", "file:ent?mode=memory&_fk=1")
+	defer client.Close()
+
+	worker := &Worker{
+		Model:          &models.Model{Client: client},
+		VaultKey:       make([]byte, crypto.KeySize),
+		NATSConnection: nc,
+	}
+
+	sub, err := nc.QueueSubscribe(openuem_nats.BitLockerEscrowSubjectPattern, "openuem-agents", worker.BitLockerEscrowHandler)
+	if err != nil {
+		t.Fatalf("failed to queue subscribe: %v", err)
+	}
+	defer sub.Unsubscribe()
+	_ = nc.Flush()
+
+	agentID := "agent-req-reply-err"
+	subject := openuem_nats.BitLockerEscrowSubject(agentID)
+	respMsg, err := nc.Request(subject, []byte("invalid json payload"), 5*time.Second)
+	if err != nil {
+		t.Fatalf("nc.Request failed: %v", err)
+	}
+
+	var resp openuem_nats.BitLockerEscrowResponse
+	if err := json.Unmarshal(respMsg.Data, &resp); err != nil {
+		t.Fatalf("failed to unmarshal BitLockerEscrowResponse: %v", err)
+	}
+
+	if resp.Success {
+		t.Fatalf("expected escrow response success false, got true")
+	}
+	if resp.Error == "" {
+		t.Fatalf("expected non-empty error in error response")
+	}
+}
+
+func TestBitLockerEscrowHandler_RequestReply_DBValidationError(t *testing.T) {
+	natsURL, cleanupNATS := startTestNatsServer(t)
+	defer cleanupNATS()
+
+	nc, err := nats.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("failed to connect to test nats: %v", err)
+	}
+	defer nc.Close()
+
+	client := enttest.Open(t, "sqlite3", "file:ent?mode=memory&_fk=1")
+	defer client.Close()
+
+	vaultKey := make([]byte, crypto.KeySize)
+	rand.Read(vaultKey)
+
+	worker := &Worker{
+		Model:          &models.Model{Client: client},
+		VaultKey:       vaultKey,
+		NATSConnection: nc,
+	}
+
+	sub, err := nc.QueueSubscribe(openuem_nats.BitLockerEscrowSubjectPattern, "openuem-agents", worker.BitLockerEscrowHandler)
+	if err != nil {
+		t.Fatalf("failed to queue subscribe: %v", err)
+	}
+	defer sub.Unsubscribe()
+	_ = nc.Flush()
+
+	agentID := "agent-req-reply-validation"
+	// Missing KeyID and RecoveryPassword
+	req := openuem_nats.BitLockerEscrowRequest{
+		AgentID:     agentID,
+		DriveLetter: "C:",
+	}
+	reqData, _ := json.Marshal(req)
+
+	subject := openuem_nats.BitLockerEscrowSubject(agentID)
+	respMsg, err := nc.Request(subject, reqData, 5*time.Second)
+	if err != nil {
+		t.Fatalf("nc.Request failed: %v", err)
+	}
+
+	var resp openuem_nats.BitLockerEscrowResponse
+	if err := json.Unmarshal(respMsg.Data, &resp); err != nil {
+		t.Fatalf("failed to unmarshal BitLockerEscrowResponse: %v", err)
+	}
+
+	if resp.Success {
+		t.Fatalf("expected success false for invalid escrow request, got true")
+	}
+	if resp.Error == "" {
+		t.Fatalf("expected error message for missing fields")
 	}
 }
