@@ -39,5 +39,10 @@ func CommonFlags() []cli.Flag {
 			Usage:   "master key used to encrypt sensitive fields in the database, need to be 32 bytes long (for example 32 ASCII characters)",
 			EnvVars: []string{"ENCRYPTION_MASTER_KEY"},
 		},
+		&cli.StringFlag{
+			Name:    "vault-key",
+			Usage:   "base64-encoded 32-byte AES key used to encrypt BitLocker recovery passwords in the vault",
+			EnvVars: []string{"OPENUEM_VAULT_KEY"},
+		},
 	}
 }

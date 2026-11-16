@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/open-uem/openuem-worker/internal/crypto"
 	"github.com/open-uem/utils"
 	"github.com/urfave/cli/v2"
 )
@@ -37,5 +38,12 @@ func (w *Worker) CheckCLICommonRequisites(cCtx *cli.Context) error {
 
 	w.EncryptionMasterKey = cCtx.String("encryption-master-key")
 	w.NATSServers = cCtx.String("nats-servers")
+
+	if vaultKeyStr := cCtx.String("vault-key"); vaultKeyStr != "" {
+		if key, err := crypto.ValidateVaultKey(vaultKeyStr); err == nil {
+			w.VaultKey = key
+		}
+	}
+
 	return nil
 }

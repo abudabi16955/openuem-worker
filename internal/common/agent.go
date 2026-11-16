@@ -92,6 +92,10 @@ func (w *Worker) SubscribeToAgentWorkerQueues() error {
 		return err
 	}
 	log.Printf("[INFO]: subscribed to message wingetcfg.task_started")
+
+	if err := w.SubscribeToBitLockerWorkerQueues(); err != nil {
+		return err
+	}
 	return nil
 }
 

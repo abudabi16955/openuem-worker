@@ -10,11 +10,13 @@ import (
 
 	"github.com/go-co-op/gocron/v2"
 	"github.com/open-uem/openuem-worker/internal/common"
+	"github.com/open-uem/openuem-worker/internal/crypto"
 )
 
 func main() {
 	var err error
 	w := common.NewWorker("openuem-agent-worker")
+	w.VaultKey = crypto.MustGetVaultKey()
 
 	// Start Task Scheduler
 	w.TaskScheduler, err = gocron.NewScheduler()
