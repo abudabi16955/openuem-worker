@@ -3,6 +3,12 @@ package common
 import (
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,10 +18,6 @@ import (
 	openuem_nats "github.com/open-uem/nats"
 	"github.com/open-uem/openuem-worker/internal/crypto"
 	"github.com/open-uem/openuem-worker/internal/models"
-	"fmt"
-	"net"
-	"os/exec"
-	"strconv"
 )
 
 func TestBitLockerEscrowHandler_SuccessAndRotation(t *testing.T) {
@@ -411,4 +413,441 @@ func TestBitLockerEscrowHandler_RequestReply_DBValidationError(t *testing.T) {
 	if resp.Error == "" {
 		t.Fatalf("expected error message for missing fields")
 	}
+}
+
+type testACLCluster struct {
+	port                int
+	ConnectWorker       func(t *testing.T, opts ...nats.Option) *nats.Conn
+	ConnectAgent        func(t *testing.T, opts ...nats.Option) *nats.Conn
+	ConnectUnauthorized func(t *testing.T, opts ...nats.Option) *nats.Conn
+}
+
+func startTestNatsServerWithACL(t *testing.T) (*testACLCluster, func()) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to find free port for nats: %v", err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+
+	conf := fmt.Sprintf(`
+port: %d
+authorization {
+  users = [
+    {
+      user: "worker"
+      password: "worker-password"
+      permissions {
+        sub {
+          allow: [
+            "_INBOX.>",
+            "report openuem-agents",
+            "deployresult openuem-agents",
+            "ping.agentworker openuem-agents",
+            "agentconfig openuem-agents",
+            "wingetcfg.> openuem-agents",
+            "ansiblecfg.> openuem-agents",
+            "agent.bitlocker.escrow.* openuem-agents",
+            "agent.bitlocker.rotate.* openuem-agents"
+          ]
+        }
+      }
+    },
+    {
+      user: "agent"
+      password: "agent-password"
+      permissions {
+        sub {
+          allow: [
+            "_INBOX.>",
+            "agent.update.>",
+            "agent.uninstall.>",
+            "agentrollback.>",
+            "agent.certificate",
+            "agent.newconfig",
+            "agent.installpackage.>",
+            "agent.uninstallpackage.>",
+            "agent.updatepackage.>",
+            "agent.enable.>",
+            "agent.disable.>",
+            "agent.report.>",
+            "agent.installpackage.>",
+            "agent.settings.>",
+            "agent.startvnc.> openuem-agent-management",
+            "agent.stopvnc.> openuem-agent-management",
+            "agent.restart.> openuem-agent-management",
+            "agent.poweroff.> openuem-agent-management",
+            "agent.reboot.> openuem-agent-management",
+            "agent.removeprinter.> openuem-agent-management",
+            "agent.defaultprinter.> openuem-agent-management",
+            "agent.rustdesk.> openuem-agent-management",
+            "agent.startsftp.> openuem-agent-management",
+            "agent.netbird.> openuem-agent-management",
+            "agent.ping.> openuem-agent-management",
+            "agent.ansible.> openuem-agent-management",
+            "agent.windowstask.> openuem-agent-management",
+            "agent.runprofile.> openuem-agent-management",
+            "agent.bitlocker.force_escrow.>",
+            "agent.bitlocker.rotate.>"
+          ]
+        }
+        publish {
+          allow: [
+            "report",
+            "_INBOX.>",
+            "deployresult",
+            "agentconfig",
+            "wingetcfg.>",
+            "ansiblecfg.>",
+            "$JS.API.STREAM.INFO.AGENTS_STREAM",
+            "$JS.API.CONSUMER.CREATE.>",
+            "$JS.API.CONSUMER.MSG.NEXT.>",
+            "$JS.ACK.>",
+            "$JS.NACK.>",
+            "agent.bitlocker.escrow.>",
+            "agent.bitlocker.rotate.>"
+          ]
+        }
+      }
+    },
+    {
+      user: "unauthorized"
+      password: "unauthorized-password"
+      permissions {
+        sub {
+          allow: ["_INBOX.>"]
+        }
+        publish {
+          allow: ["_INBOX.>"]
+        }
+      }
+    }
+  ]
+}
+`, port)
+
+	tmpFile, err := os.CreateTemp("", "nats-acl-*.conf")
+	if err != nil {
+		t.Fatalf("failed to create temp config file for nats: %v", err)
+	}
+	if _, err := tmpFile.WriteString(conf); err != nil {
+		os.Remove(tmpFile.Name())
+		t.Fatalf("failed to write nats acl config: %v", err)
+	}
+	tmpFile.Close()
+
+	cmd := exec.Command("nats-server", "-c", tmpFile.Name())
+	if err := cmd.Start(); err != nil {
+		os.Remove(tmpFile.Name())
+		t.Fatalf("failed to start nats-server with ACL: %v", err)
+	}
+
+	ready := false
+	for i := 0; i < 50; i++ {
+		time.Sleep(50 * time.Millisecond)
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			ready = true
+			break
+		}
+	}
+	if !ready {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		os.Remove(tmpFile.Name())
+		t.Fatalf("nats-server with ACL did not become ready in time on port %d", port)
+	}
+
+	cleanup := func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		os.Remove(tmpFile.Name())
+	}
+
+	cluster := &testACLCluster{
+		port: port,
+		ConnectWorker: func(t *testing.T, opts ...nats.Option) *nats.Conn {
+			t.Helper()
+			nc, err := nats.Connect(fmt.Sprintf("nats://worker:worker-password@127.0.0.1:%d", port), opts...)
+			if err != nil {
+				t.Fatalf("failed to connect worker to nats with ACL: %v", err)
+			}
+			return nc
+		},
+		ConnectAgent: func(t *testing.T, opts ...nats.Option) *nats.Conn {
+			t.Helper()
+			nc, err := nats.Connect(fmt.Sprintf("nats://agent:agent-password@127.0.0.1:%d", port), opts...)
+			if err != nil {
+				t.Fatalf("failed to connect agent to nats with ACL: %v", err)
+			}
+			return nc
+		},
+		ConnectUnauthorized: func(t *testing.T, opts ...nats.Option) *nats.Conn {
+			t.Helper()
+			nc, err := nats.Connect(fmt.Sprintf("nats://unauthorized:unauthorized-password@127.0.0.1:%d", port), opts...)
+			if err != nil {
+				t.Fatalf("failed to connect unauthorized user to nats with ACL: %v", err)
+			}
+			return nc
+		},
+	}
+
+	return cluster, cleanup
+}
+
+func TestBitLockerEscrowHandler_ACL_Success(t *testing.T) {
+	cluster, cleanup := startTestNatsServerWithACL(t)
+	defer cleanup()
+
+	workerNC := cluster.ConnectWorker(t)
+	defer workerNC.Close()
+
+	client := enttest.Open(t, "sqlite3", "file:ent?mode=memory&_fk=1")
+	defer client.Close()
+
+	vaultKey := make([]byte, crypto.KeySize)
+	if _, err := rand.Read(vaultKey); err != nil {
+		t.Fatalf("failed to generate random vault key: %v", err)
+	}
+
+	worker := &Worker{
+		Model:          &models.Model{Client: client},
+		VaultKey:       vaultKey,
+		NATSConnection: workerNC,
+	}
+
+	// 1. Worker queue subscribes to escrow and rotate subjects with openuem-agents queue
+	escrowSub, err := workerNC.QueueSubscribe(openuem_nats.BitLockerEscrowSubjectPattern, "openuem-agents", worker.BitLockerEscrowHandler)
+	if err != nil {
+		t.Fatalf("worker failed to queue subscribe to escrow: %v", err)
+	}
+	defer escrowSub.Unsubscribe()
+
+	rotateSub, err := workerNC.QueueSubscribe(openuem_nats.BitLockerRotateSubjectPattern, "openuem-agents", worker.BitLockerRotateHandler)
+	if err != nil {
+		t.Fatalf("worker failed to queue subscribe to rotate: %v", err)
+	}
+	defer rotateSub.Unsubscribe()
+
+	if err := workerNC.Flush(); err != nil {
+		t.Fatalf("failed to flush worker connection: %v", err)
+	}
+
+	// 2. Agent connects with ACL credentials and publishes escrow request
+	agentNC := cluster.ConnectAgent(t)
+	defer agentNC.Close()
+
+	agentID := "agent-acl-verified-1"
+	escrowReq := openuem_nats.BitLockerEscrowRequest{
+		AgentID:          agentID,
+		DriveLetter:      "C:",
+		KeyID:            "{KEY-ACL-SUCCESS-1}",
+		RecoveryPassword: "123456-654321-123456-654321",
+		CreatedAt:        time.Now(),
+	}
+	reqData, err := json.Marshal(escrowReq)
+	if err != nil {
+		t.Fatalf("failed to marshal escrow request: %v", err)
+	}
+
+	subject := openuem_nats.BitLockerEscrowSubject(agentID)
+	respMsg, err := agentNC.Request(subject, reqData, 5*time.Second)
+	if err != nil {
+		t.Fatalf("agentNC.Request failed under ACL: %v", err)
+	}
+
+	var resp openuem_nats.BitLockerEscrowResponse
+	if err := json.Unmarshal(respMsg.Data, &resp); err != nil {
+		t.Fatalf("failed to unmarshal BitLockerEscrowResponse: %v", err)
+	}
+
+	if !resp.Success {
+		t.Fatalf("expected escrow response success true, got false (error: %s)", resp.Error)
+	}
+	if resp.Error != "" {
+		t.Fatalf("expected empty error in success response, got %s", resp.Error)
+	}
+
+	// Verify key saved and active in DB
+	key, err := worker.Model.GetActiveBitLockerKey(agentID, "C:")
+	if err != nil {
+		t.Fatalf("failed to get active key from DB: %v", err)
+	}
+	if key.KeyID != "{KEY-ACL-SUCCESS-1}" {
+		t.Fatalf("expected KeyID {KEY-ACL-SUCCESS-1}, got %s", key.KeyID)
+	}
+	if !key.IsActive {
+		t.Fatal("expected key to be active")
+	}
+
+	// Verify key password decrypts correctly
+	decrypted, err := crypto.DecryptRecoveryPassword(key.EncryptedPassword, vaultKey)
+	if err != nil || decrypted != escrowReq.RecoveryPassword {
+		t.Fatalf("failed to decrypt password: %v, got %q", err, decrypted)
+	}
+
+	// 3. Agent publishes rotate message under ACL
+	rotateReq := openuem_nats.BitLockerRotateConfirmation{
+		AgentID:     agentID,
+		DriveLetter: "C:",
+		OldKeyID:    "{KEY-ACL-SUCCESS-1}",
+		NewKeyID:    "{KEY-ACL-ROTATED-2}",
+		RotatedAt:   time.Now(),
+	}
+	rotData, err := json.Marshal(rotateReq)
+	if err != nil {
+		t.Fatalf("failed to marshal rotate confirmation: %v", err)
+	}
+
+	if err := agentNC.Publish(openuem_nats.BitLockerRotateSubject(agentID), rotData); err != nil {
+		t.Fatalf("agentNC.Publish failed under ACL: %v", err)
+	}
+	if err := agentNC.Flush(); err != nil {
+		t.Fatalf("failed to flush agent connection after publish: %v", err)
+	}
+
+	// Allow handler to process
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify old key deactivated
+	history, err := worker.Model.GetBitLockerKeyHistory(agentID, "C:")
+	if err != nil {
+		t.Fatalf("failed to get key history: %v", err)
+	}
+	for _, k := range history {
+		if k.KeyID == "{KEY-ACL-SUCCESS-1}" && k.IsActive {
+			t.Fatal("expected key {KEY-ACL-SUCCESS-1} to be deactivated after rotate")
+		}
+	}
+}
+
+func TestBitLocker_ACL_PermissionsViolation(t *testing.T) {
+	cluster, cleanup := startTestNatsServerWithACL(t)
+	defer cleanup()
+
+	t.Run("UnauthorizedUser_PublishToEscrowDenied", func(t *testing.T) {
+		errCh := make(chan error, 5)
+		unauthNC := cluster.ConnectUnauthorized(t, nats.ErrorHandler(func(nc *nats.Conn, s *nats.Subscription, err error) {
+			errCh <- err
+		}))
+		defer unauthNC.Close()
+
+		_ = unauthNC.Publish("agent.bitlocker.escrow.agent-test", []byte("unauthorized escrow"))
+		_ = unauthNC.Flush()
+
+		select {
+		case err := <-errCh:
+			if !strings.Contains(err.Error(), "Permissions Violation") {
+				t.Fatalf("expected permissions violation error, got: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected publish permissions violation error, but none was received")
+		}
+	})
+
+	t.Run("UnauthorizedUser_SubscribeToEscrowDenied", func(t *testing.T) {
+		errCh := make(chan error, 5)
+		unauthNC := cluster.ConnectUnauthorized(t, nats.ErrorHandler(func(nc *nats.Conn, s *nats.Subscription, err error) {
+			errCh <- err
+		}))
+		defer unauthNC.Close()
+
+		_, _ = unauthNC.Subscribe("agent.bitlocker.escrow.*", func(m *nats.Msg) {})
+		_ = unauthNC.Flush()
+
+		select {
+		case err := <-errCh:
+			if !strings.Contains(err.Error(), "Permissions Violation") {
+				t.Fatalf("expected permissions violation error, got: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected subscribe permissions violation error, but none was received")
+		}
+	})
+
+	t.Run("Worker_SubscribeWithoutQueueGroupDenied", func(t *testing.T) {
+		errCh := make(chan error, 5)
+		workerNC := cluster.ConnectWorker(t, nats.ErrorHandler(func(nc *nats.Conn, s *nats.Subscription, err error) {
+			errCh <- err
+		}))
+		defer workerNC.Close()
+
+		// Worker is only allowed: "agent.bitlocker.escrow.* openuem-agents"
+		// Subscribing without queue group must violate ACL
+		_, _ = workerNC.Subscribe("agent.bitlocker.escrow.*", func(m *nats.Msg) {})
+		_ = workerNC.Flush()
+
+		select {
+		case err := <-errCh:
+			if !strings.Contains(err.Error(), "Permissions Violation") {
+				t.Fatalf("expected permissions violation error without queue group, got: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected permissions violation error for subscribing without queue group, but none received")
+		}
+	})
+
+	t.Run("Worker_SubscribeWithWrongQueueGroupDenied", func(t *testing.T) {
+		errCh := make(chan error, 5)
+		workerNC := cluster.ConnectWorker(t, nats.ErrorHandler(func(nc *nats.Conn, s *nats.Subscription, err error) {
+			errCh <- err
+		}))
+		defer workerNC.Close()
+
+		_, _ = workerNC.QueueSubscribe("agent.bitlocker.escrow.*", "wrong-queue", func(m *nats.Msg) {})
+		_ = workerNC.Flush()
+
+		select {
+		case err := <-errCh:
+			if !strings.Contains(err.Error(), "Permissions Violation") {
+				t.Fatalf("expected permissions violation error with wrong queue group, got: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected permissions violation error with wrong queue group, but none received")
+		}
+	})
+
+	t.Run("Agent_PublishToForbiddenSubjectDenied", func(t *testing.T) {
+		errCh := make(chan error, 5)
+		agentNC := cluster.ConnectAgent(t, nats.ErrorHandler(func(nc *nats.Conn, s *nats.Subscription, err error) {
+			errCh <- err
+		}))
+		defer agentNC.Close()
+
+		// Agent has sub.allow for force_escrow, but NOT publish permission
+		_ = agentNC.Publish("agent.bitlocker.force_escrow.agent-test", []byte("forbidden"))
+		_ = agentNC.Flush()
+
+		select {
+		case err := <-errCh:
+			if !strings.Contains(err.Error(), "Permissions Violation") {
+				t.Fatalf("expected permissions violation error for publishing to forbidden subject, got: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected permissions violation error for agent publishing to forbidden subject, but none received")
+		}
+	})
+
+	t.Run("Agent_SubscribeToForbiddenSubjectDenied", func(t *testing.T) {
+		errCh := make(chan error, 5)
+		agentNC := cluster.ConnectAgent(t, nats.ErrorHandler(func(nc *nats.Conn, s *nats.Subscription, err error) {
+			errCh <- err
+		}))
+		defer agentNC.Close()
+
+		// Agent has publish for "report", but NOT sub permission
+		_, _ = agentNC.Subscribe("report", func(m *nats.Msg) {})
+		_ = agentNC.Flush()
+
+		select {
+		case err := <-errCh:
+			if !strings.Contains(err.Error(), "Permissions Violation") {
+				t.Fatalf("expected permissions violation error for subscribing to forbidden subject, got: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected permissions violation error for agent subscribing to forbidden subject, but none received")
+		}
+	})
 }
